@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""One task button for the workspace currently shown on a monitor.
+
+Slots are filled with the windows on that workspace, then windows minimized
+from it. Click focuses an open window, or brings a minimized one back.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+STATE = RUNTIME / "hypr-minimized.json"
+CACHE = RUNTIME / "bar-icons"
+FEED = RUNTIME / "bar-feed"
+SLOTS = 6
+ICON = 18
+WS_SPAN = 10
+WS_PINNED = 5
+
+
+def hypr(what):
+    try:
+        return json.loads(subprocess.check_output(["hyprctl", what, "-j"], text=True))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+
+
+def minimized():
+    try:
+        data = json.loads(STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def label(win, saved):
+    text = ""
+    if saved:
+        text = saved.get("title") or saved.get("class") or ""
+    text = text or win.get("title") or win.get("class") or "ウィンドウ"
+    return " ".join(text.split())
+
+
+def desktop_icons():
+    if getattr(desktop_icons, "map", None) is not None:
+        return desktop_icons.map
+    found = {}
+    roots = [Path("/usr/share/applications"), Path.home() / ".local/share/applications"]
+    for part in os.environ.get("XDG_DATA_DIRS", "").split(":"):
+        if part:
+            roots.append(Path(part) / "applications")
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.glob("*.desktop"):
+            icon = wm = ""
+            try:
+                lines = path.read_text(errors="ignore").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if line.startswith("[") and line.strip() != "[Desktop Entry]":
+                    break
+                if line.startswith("Icon=") and not icon:
+                    icon = line.split("=", 1)[1].strip()
+                elif line.startswith("StartupWMClass=") and not wm:
+                    wm = line.split("=", 1)[1].strip()
+            if not icon:
+                continue
+            for key in (path.stem, wm):
+                key = key.lower()
+                if key and key not in found:
+                    found[key] = icon
+    desktop_icons.map = found
+    return found
+
+
+def icon_names(class_name):
+    name = desktop_icons().get((class_name or "").lower()) or class_name or "application-x-executable"
+    if name.startswith("/"):
+        return name, Path(name).stem, name
+    return name, name, ""
+
+
+def icon_file(class_name, dim):
+    name, key, direct = icon_names(class_name)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in key)[:80]
+    # mark: glyph only, same as the tray (no dark app-icon plate).
+    dest = CACHE / f"{safe}-{'dim' if dim else 'mark'}.png"
+    if dest.exists():
+        return str(dest)
+
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, Gtk
+
+    if direct:
+        src = direct
+    else:
+        theme = Gtk.IconTheme.get_default()
+        info = theme.lookup_icon(name, 128, 0)
+        if info is None:
+            info = theme.lookup_icon("application-x-executable", 128, 0)
+        src = info.get_filename() if info else ""
+    if not src:
+        return ""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    canvas = glyph_icon(src, 110 if dim else 255)
+    canvas.savev(str(dest), "png", [], [])
+    return str(dest)
+
+
+def glyph_icon(src, alpha):
+    """Draw the icon the way the tray does: the mark itself, not the tile behind it."""
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, GLib
+
+    image = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, 128, 128, True)
+    if not image.get_has_alpha():
+        image = image.add_alpha(False, 0, 0, 0)
+    width = image.get_width()
+    height = image.get_height()
+    channels = image.get_n_channels()
+    stride = image.get_rowstride()
+    buf = bytearray(image.get_pixels())
+
+    def lum(r, g, b):
+        return (r * 54 + g * 183 + b * 19) >> 8
+
+    opaque = plate = light_sum = sat_sum = 0
+    for y in range(height):
+        row = y * stride
+        for x in range(width):
+            i = row + x * channels
+            r, g, b, a = buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+            if a < 16:
+                continue
+            opaque += 1
+            spread = max(r, g, b) - min(r, g, b)
+            sat_sum += spread
+            light_sum += lum(r, g, b)
+            if spread < 28 and lum(r, g, b) < 48:
+                plate += 1
+
+    # A dark rounded tile with a lighter mark on it (Zen, Cursor, …).
+    if opaque and plate > opaque * 0.30 and (opaque - plate) > opaque * 0.04:
+        for y in range(height):
+            row = y * stride
+            for x in range(width):
+                i = row + x * channels
+                r, g, b, a = buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+                if a < 16:
+                    continue
+                spread = max(r, g, b) - min(r, g, b)
+                if spread < 36 and lum(r, g, b) < 70:
+                    buf[i + 3] = 0
+    elif opaque and light_sum / opaque < 90 and sat_sum / opaque < 24:
+        # Black symbolic icons disappear on the bar. The tray paints those white.
+        for y in range(height):
+            row = y * stride
+            for x in range(width):
+                i = row + x * channels
+                if buf[i + 3] < 16:
+                    continue
+                buf[i] = buf[i + 1] = buf[i + 2] = 255
+
+    painted = GdkPixbuf.Pixbuf.new_from_bytes(
+        GLib.Bytes.new(bytes(buf)),
+        GdkPixbuf.Colorspace.RGB,
+        True,
+        8,
+        width,
+        height,
+        stride,
+    )
+    min_x, min_y, max_x, max_y = width, height, -1, -1
+    for y in range(height):
+        row = y * stride
+        for x in range(width):
+            if buf[row + x * channels + 3] > 12:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+    if max_x < 0:
+        painted = image
+        min_x, min_y, max_x, max_y = 0, 0, width - 1, height - 1
+
+    mark = painted.new_subpixbuf(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+    pad = 1
+    inner = ICON - pad * 2
+    scale = min(inner / mark.get_width(), inner / mark.get_height())
+    nw = max(1, round(mark.get_width() * scale))
+    nh = max(1, round(mark.get_height() * scale))
+    scaled = mark.scale_simple(nw, nh, GdkPixbuf.InterpType.HYPER)
+    canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, ICON, ICON)
+    canvas.fill(0)
+    x = (ICON - nw) // 2
+    y = (ICON - nh) // 2
+    scaled.composite(
+        canvas, x, y, nw, nh, x, y, 1, 1, GdkPixbuf.InterpType.NEAREST, alpha,
+    )
+    return canvas
+
+
+def collect_rows(windows, saved, workspace):
+    by_address = {win.get("address"): win for win in windows}
+    open_windows = [
+        win for win in windows
+        if str((win.get("workspace") or {}).get("id", "")) == workspace
+        and (win.get("workspace") or {}).get("name") != "special:minimized"
+        and win.get("mapped", True)
+    ]
+    open_windows.sort(key=lambda win: win.get("focusHistoryID", 0))
+
+    hidden = []
+    for address, info in saved.items():
+        win = by_address.get(address)
+        if not win:
+            continue
+        if (win.get("workspace") or {}).get("name") != "special:minimized":
+            continue
+        if str(info.get("workspace", "")) != workspace:
+            continue
+        hidden.append((win, info))
+
+    rows = [{"window": win, "saved": None, "minimized": False} for win in open_windows]
+    rows += [{"window": win, "saved": info, "minimized": True} for win, info in hidden]
+    return rows
+
+
+def tasks(output):
+    monitors = hypr("monitors")
+    workspace = ""
+    for monitor in monitors if isinstance(monitors, list) else []:
+        if monitor.get("name") == output:
+            workspace = str(monitor.get("activeWorkspace", {}).get("id", ""))
+            break
+    if not workspace:
+        return []
+    windows = hypr("clients")
+    if not isinstance(windows, list):
+        return []
+    return collect_rows(windows, minimized(), workspace)
+
+
+def emit(output, index):
+    rows = tasks(output)
+    if index >= len(rows):
+        print()
+        print()
+        return
+    row = rows[index]
+    path = icon_file(row["window"].get("class") or "", row["minimized"])
+    tip = label(row["window"], row["saved"])
+    if row["minimized"]:
+        tip += " · 最小化 · クリックで戻す"
+    elif index == SLOTS - 1 and len(rows) > SLOTS:
+        tip += " · ほか " + "、".join(label(item["window"], item["saved"]) for item in rows[SLOTS:])
+    print(path)
+    print(tip)
+
+
+def row_tip(rows, index):
+    row = rows[index]
+    tip = label(row["window"], row["saved"])
+    if row["minimized"]:
+        tip += " · 最小化 · クリックで戻す"
+    elif index == SLOTS - 1 and len(rows) > SLOTS:
+        tip += " · ほか " + "、".join(label(item["window"], item["saved"]) for item in rows[SLOTS:])
+    return tip
+
+
+def click(output, index):
+    try:
+        shown = json.loads((FEED / f"apps-{output}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        shown = []
+    if index >= len(shown):
+        return
+    row = shown[index]
+    address = row.get("address") or ""
+    if not address:
+        return
+    if row.get("minimized"):
+        workspace = row.get("workspace") or ""
+        if workspace:
+            subprocess.run([
+                str(Path.home() / ".config/hypr/scripts/window-min"),
+                "restore", address, workspace,
+            ], check=False)
+        return
+    subprocess.run([
+        "hyprctl", "dispatch",
+        f"hl.dsp.focus({{ window = 'address:{address}' }})",
+    ], check=False)
+
+
+def monitor_rank(name):
+    return (0 if name.startswith(("eDP-", "LVDS-", "DSI-")) else 1, name)
+
+
+def publish():
+    """One pass for every workspace button and task icon, then wake Waybar."""
+    monitors = hypr("monitors")
+    windows = hypr("clients")
+    workspaces = hypr("workspaces")
+    if not isinstance(monitors, list):
+        monitors = []
+    if not isinstance(windows, list):
+        windows = []
+    if not isinstance(workspaces, list):
+        workspaces = []
+    saved = minimized()
+    counts = {
+        str(ws.get("name")): ws.get("windows", 0)
+        for ws in workspaces if isinstance(ws, dict)
+    }
+    FEED.mkdir(parents=True, exist_ok=True)
+    names = sorted((m.get("name") for m in monitors if m.get("name") and not m.get("disabled")), key=monitor_rank)
+    for slot, output in enumerate(names):
+        active_name = ""
+        active_id = ""
+        for monitor in monitors:
+            if monitor.get("name") == output:
+                ws = monitor.get("activeWorkspace") or {}
+                active_name = str(ws.get("name", ""))
+                active_id = str(ws.get("id", ""))
+                break
+        for index in range(1, WS_PINNED + 1):
+            ws_name = str(slot * WS_SPAN + index)
+            windows_here = counts.get(ws_name, 0) or 0
+            if active_name == ws_name:
+                state = "active"
+            elif windows_here:
+                state = "occupied"
+            else:
+                state = "idle"
+            payload = {
+                "text": str(index),
+                "class": state,
+                "tooltip": f"ワークスペース {index}" + (f" · {windows_here} 個のウィンドウ" if windows_here else ""),
+            }
+            (FEED / f"ws-{output}-{index}.json").write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+        rows = collect_rows(windows, saved, active_id) if active_id else []
+        shown = []
+        for index in range(SLOTS):
+            if index >= len(rows):
+                (FEED / f"app-{output}-{index}.txt").write_text("\n\n")
+                continue
+            row = rows[index]
+            path = icon_file(row["window"].get("class") or "", row["minimized"])
+            tip = row_tip(rows, index)
+            (FEED / f"app-{output}-{index}.txt").write_text(f"{path}\n{tip}\n")
+            shown.append({
+                "address": row["window"].get("address") or "",
+                "minimized": row["minimized"],
+                "workspace": (row["saved"] or {}).get("workspace") or active_id,
+            })
+        (FEED / f"apps-{output}.json").write_text(json.dumps(shown, ensure_ascii=False))
+    subprocess.run(["pkill", "-RTMIN+8", "-x", "waybar"], check=False)
+    subprocess.run(["pkill", "-RTMIN+10", "-x", "waybar"], check=False)
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "publish":
+        publish()
+        return
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: bar-tasks OUTPUT INDEX | bar-tasks click OUTPUT INDEX | bar-tasks publish")
+    if sys.argv[1] == "click":
+        click(sys.argv[2], int(sys.argv[3]))
+        return
+    emit(sys.argv[1], int(sys.argv[2]))
+
+
+if __name__ == "__main__":
+    main()

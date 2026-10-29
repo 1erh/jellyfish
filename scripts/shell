@@ -1,0 +1,172 @@
+#!/bin/sh
+# Minimal shell actions: power, clipboard, screenshot, key list.
+set -eu
+
+# pick ICON WIDTH ROW... -> prints the chosen row index.
+pick() {
+    icon=$1
+    width=$2
+    shift 2
+    printf '%s\n' "$@" | fuzzel --dmenu --index --no-icons --no-sort --only-match \
+        --anchor center --x-margin 0 --y-margin 0 \
+        --prompt "$icon   " --width "$width" --lines "$#" --minimal-lines \
+        --placeholder "${PLACEHOLDER:-}"
+}
+
+confirm() {
+    i=$(PLACEHOLDER="$1しますか？" pick "$2" 26 "󰄬   $1する" "󰅖   キャンセル") || return 1
+    [ "$i" = 0 ]
+}
+
+suspend() {
+    loginctl lock-session
+    sleep 1
+    systemctl suspend
+}
+
+power() {
+    i=$(PLACEHOLDER="電源" pick "󰐥" 26 \
+        "󰌾   ロック" \
+        "󰤄   スリープ" \
+        "󰍃   ログアウト" \
+        "󰜉   再起動" \
+        "󰐥   電源を切る") || exit 0
+    case "$i" in
+        0) hyprlock ;;
+        1) suspend ;;
+        2) confirm "ログアウト" "󰍃" && hyprctl dispatch 'hl.dsp.exit()' ;;
+        3) confirm "再起動" "󰜉" && systemctl reboot ;;
+        4) confirm "電源オフ" "󰐥" && systemctl poweroff ;;
+    esac
+}
+
+clip() {
+    list=$(cliphist list || true)
+    if [ -z "$list" ]; then
+        PLACEHOLDER="履歴はまだありません" pick "󰅇" 34 >/dev/null || true
+        exit 0
+    fi
+    choice=$({ printf '%s\n' "$list" | cut -f2- | sed 's/^/󰅍   /'; printf '󰆴   履歴をすべて消去\n'; } \
+        | fuzzel --dmenu --index --no-icons --no-sort --only-match \
+            --anchor center --x-margin 0 --y-margin 0 \
+            --prompt "󰅇   " --placeholder "クリップボード履歴を検索" --width 52 --lines 9 --minimal-lines) || exit 0
+    total=$(printf '%s\n' "$list" | wc -l)
+    if [ "$choice" -ge "$total" ]; then
+        confirm "履歴を消去" "󰆴" && cliphist wipe
+        exit 0
+    fi
+    printf '%s\n' "$list" | sed -n "$((choice + 1))p" | cliphist decode | wl-copy
+}
+
+shot() {
+    mode=${1:-}
+    if [ -z "$mode" ]; then
+        i=$(PLACEHOLDER="スクリーンショット" pick "󰹑" 26 \
+            "󰩭   範囲を選ぶ" \
+            "󰖯   このウィンドウ" \
+            "󰍹   この画面" \
+            "󰍺   すべての画面") || exit 0
+        mode=$(printf 'region\nwindow\noutput\nall\n' | sed -n "$((i + 1))p")
+        sleep 0.15
+    fi
+
+    dir="${HOME}/Pictures/Screenshots"
+    mkdir -p "$dir"
+    file="${dir}/$(date +%Y%m%d-%H%M%S).png"
+
+    case "$mode" in
+        region)
+            geo=$(slurp -d -b 0c0b0a66 -c f4f0e8cc -s ffffff0a -w 1 -F "UDEV Gothic") || exit 0
+            grim -g "$geo" "$file"
+            ;;
+        window)
+            geo=$(hyprctl activewindow -j | python3 -c 'import json,sys; w=json.load(sys.stdin); x,y=w["at"]; ww,hh=w["size"]; print(f"{x},{y} {ww}x{hh}")')
+            grim -g "$geo" "$file"
+            ;;
+        output)
+            name=$(hyprctl monitors -j | python3 -c 'import json,sys; ms=json.load(sys.stdin); print(next(m["name"] for m in ms if m.get("focused")))')
+            grim -o "$name" "$file"
+            ;;
+        all|full)
+            grim "$file"
+            ;;
+        *)
+            echo "unknown shot mode: $mode" >&2
+            exit 1
+            ;;
+    esac
+
+    wl-copy < "$file"
+    notify-send -a "スクリーンショット" -i "$file" -h string:x-canonical-private-synchronous:shot \
+        "コピーしました" "$(basename "$file") を保存しました"
+}
+
+keys() {
+    fuzzel --dmenu --no-icons --no-sort --prompt "󰌌   " --placeholder "ショートカットを検索" \
+        --font "UDEV Gothic:size=13.5,Symbols Nerd Font Mono:size=15" \
+        --anchor center --x-margin 0 --y-margin 0 \
+        --width 54 --lines 12 <<'EOF' || true
+Win                    アプリを開く
+Super Enter            ターミナル
+Super E                ファイル
+Super B                ブラウザ
+Super V                クリップボード履歴
+Super N                通知センター
+Super Shift N          おやすみモード
+Super M                電源
+Super L                ロック
+Super Q                閉じる
+Super F                全画面
+Super T                フロート切替
+Super 矢印             フォーカス
+Super Shift 矢印       ウィンドウを動かす
+Super J                分割を左右と上下で切替
+Super Z                最小化
+Super Shift Z          最小化を戻す
+Super Tab              ワークスペース
+Super S                スクラッチパッド
+Super Shift S          スクラッチパッドへ送る
+Super 1-9              ワークスペース
+バーの数字でスクロール ワークスペースを順に切替
+Super Shift 1-9        ウィンドウを送る
+Super Alt 左右         隣の画面
+Super Alt Shift 左右   ウィンドウを隣の画面へ
+Super P                ディスプレイ配置
+Print                  スクリーンショット
+Super Shift Print      範囲をすぐ撮る
+半角/全角              日本語入力
+EOF
+}
+
+volume() {
+    sink=@DEFAULT_AUDIO_SINK@
+    case "${1:-}" in
+        up) wpctl set-volume -l 1 "$sink" 5%+ ;;
+        down) wpctl set-volume "$sink" 5%- ;;
+        mute) wpctl set-mute "$sink" toggle ;;
+    esac
+    out=$(wpctl get-volume "$sink")
+    level=$(printf '%s\n' "$out" | awk '{ printf "%d", $2 * 100 + 0.5 }')
+    case "$out" in
+        *MUTED*) icon="󰝟"; label="消音"; level=0 ;;
+        *) if [ "$level" -ge 66 ]; then icon="󰕾"; elif [ "$level" -ge 33 ]; then icon="󰖀"; else icon="󰕿"; fi
+           label="${level}%" ;;
+    esac
+    notify-send -a "音量" -u low -t 1200 \
+        -h "int:value:${level}" -h string:x-canonical-private-synchronous:volume \
+        "${icon}   音量" "$label"
+}
+
+cmd=${1:-}
+case "$cmd" in
+    power) power ;;
+    clip) clip ;;
+    shot) shot "${2:-}" ;;
+    keys) keys ;;
+    volume) volume "${2:-}" ;;
+    suspend|sleep) suspend ;;
+    *)
+        echo "usage: shell power|clip|shot [region|window|output|all]|keys|volume up|down|mute|suspend" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Connect to a Wi-Fi network that does not broadcast its name.
+
+`nmcli device wifi connect <SSID> hidden yes` still looks the name up in the
+scan list and exits with "No network with SSID ... found". A saved profile
+with wifi.hidden makes NetworkManager probe that SSID directly.
+"""
+import subprocess
+import sys
+
+
+def nm(*args):
+    return subprocess.run(["nmcli", *args], text=True, capture_output=True)
+
+
+def fail(result):
+    message = (result.stderr or result.stdout or "接続できませんでした").strip().split("\n")[0]
+    lowered = message.lower()
+    if "secret" in lowered or "password" in lowered or "psk" in lowered:
+        message = "パスワードが違います"
+    elif "no network with ssid" in lowered or "not found" in lowered:
+        message = "その SSID のネットワークが応答しません"
+    sys.stderr.write(message + "\n")
+    raise SystemExit(result.returncode or 1)
+
+
+def wifi_connections():
+    listed = nm("-t", "-f", "NAME,UUID,TYPE", "connection", "show")
+    if listed.returncode != 0:
+        fail(listed)
+    found = []
+    for line in listed.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 3 or parts[-1] != "802-11-wireless":
+            continue
+        uuid = parts[-2]
+        ssid = nm("-g", "802-11-wireless.ssid", "connection", "show", uuid).stdout.strip()
+        found.append((uuid, ssid))
+    return found
+
+
+def main():
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: wifi-hidden IFACE SSID [PSK]")
+    iface, ssid = sys.argv[1], sys.argv[2]
+    psk = sys.argv[3] if len(sys.argv) > 3 else ""
+
+    match = next((uuid for uuid, saved in wifi_connections() if saved == ssid), None)
+    if match:
+        args = ["connection", "modify", match, "802-11-wireless.hidden", "yes"]
+        if psk:
+            args += ["802-11-wireless-security.key-mgmt", "wpa-psk", "802-11-wireless-security.psk", psk]
+        changed = nm(*args)
+        if changed.returncode != 0:
+            fail(changed)
+        target = match
+    else:
+        args = ["connection", "add", "type", "wifi", "con-name", ssid, "ifname", iface,
+                "ssid", ssid, "802-11-wireless.hidden", "yes"]
+        if psk:
+            args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
+        added = nm(*args)
+        if added.returncode != 0:
+            fail(added)
+        target = ssid
+
+    up = nm("-w", "30", "connection", "up", target, "ifname", iface)
+    if up.returncode != 0:
+        fail(up)
+
+
+if __name__ == "__main__":
+    main()

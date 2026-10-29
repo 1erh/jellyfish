@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""List and activate NetworkManager VPN profiles for the bar and the panel."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+VPN_TYPES = {"vpn", "wireguard", "tun"}
+LABELS = {
+    "org.freedesktop.NetworkManager.openvpn": "OpenVPN",
+    "org.freedesktop.NetworkManager.wireguard": "WireGuard",
+    "org.freedesktop.NetworkManager.l2tp": "L2TP",
+    "org.freedesktop.NetworkManager.pptp": "PPTP",
+    "org.freedesktop.NetworkManager.openconnect": "OpenConnect",
+    "org.freedesktop.NetworkManager.strongswan": "IPsec",
+    "org.freedesktop.NetworkManager.vpnc": "VPNC",
+    "org.freedesktop.NetworkManager.sstp": "SSTP",
+    "org.freedesktop.NetworkManager.fortisslvpn": "FortiGate",
+}
+
+
+def nm(*args, timeout=15):
+    return subprocess.run(["nmcli", *args], text=True, capture_output=True, timeout=timeout)
+
+
+def split_nmcli(line):
+    parts = []
+    buf = []
+    i = 0
+    while i < len(line):
+        if line[i] == "\\" and i + 1 < len(line):
+            buf.append(line[i + 1])
+            i += 2
+            continue
+        if line[i] == ":":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(line[i])
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def kind(typ, uuid):
+    if typ == "wireguard":
+        return "WireGuard"
+    if typ == "tun":
+        return "TUN"
+    service = nm("-g", "vpn.service-type", "connection", "show", uuid).stdout.strip()
+    return LABELS.get(service, "VPN")
+
+
+def profiles(labeled=False):
+    listed = nm("-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show")
+    if listed.returncode != 0:
+        return []
+    found = []
+    for line in listed.stdout.splitlines():
+        parts = split_nmcli(line)
+        if len(parts) < 4:
+            continue
+        name, uuid, typ, device = parts[0], parts[-3], parts[-2], parts[-1]
+        if typ not in VPN_TYPES:
+            continue
+        found.append({
+            "name": name,
+            "uuid": uuid,
+            "type": kind(typ, uuid) if labeled else typ,
+            "active": device not in ("", "--"),
+        })
+    found.sort(key=lambda row: (not row["active"], row["name"].lower()))
+    return found
+
+
+def explain(result):
+    message = (result.stderr or result.stdout or "接続できませんでした").strip().split("\n")[0]
+    lowered = message.lower()
+    if "secret" in lowered or "no secrets" in lowered:
+        message = "パスワードが必要です"
+    elif "password" in lowered or "authentication failed" in lowered or "invalid secret" in lowered:
+        message = "パスワードが違います"
+    elif "timeout" in lowered or "timed out" in lowered:
+        message = "VPN が応答しません"
+    sys.stderr.write(message + "\n")
+    raise SystemExit(result.returncode or 1)
+
+
+def signal_bar():
+    subprocess.run(["pkill", "-RTMIN+9", "-x", "waybar"], check=False)
+
+
+def up(uuid, password):
+    args = ["-w", "40", "connection", "up", uuid]
+    path = None
+    result = None
+    try:
+        if password:
+            fd, path = tempfile.mkstemp(prefix="vpn-")
+            os.chmod(path, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(f"vpn.secrets.password:{password}\n")
+                handle.write(f"802-1x.password:{password}\n")
+            args += ["passwd-file", path]
+        result = nm(*args, timeout=50)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if result is None or result.returncode != 0:
+        if result is None:
+            sys.stderr.write("接続できませんでした\n")
+            raise SystemExit(1)
+        explain(result)
+    signal_bar()
+
+
+def down(uuid):
+    result = nm("-w", "20", "connection", "down", uuid, timeout=25)
+    if result.returncode != 0:
+        explain(result)
+    signal_bar()
+
+
+def status():
+    active = [row for row in profiles() if row["active"]]
+    if active:
+        extra = f" ほか {len(active) - 1}" if len(active) > 1 else ""
+        payload = {
+            "text": "󰖂",
+            "class": "on",
+            "tooltip": f"{active[0]['name']}{extra} · クリックで一覧 · 右クリックで切断",
+        }
+    else:
+        payload = {"text": "󰖂", "class": "off", "tooltip": "VPN · クリックで一覧"}
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "list":
+        print(json.dumps(profiles(labeled=True), ensure_ascii=False))
+    elif cmd == "status":
+        status()
+    elif cmd == "up" and len(sys.argv) >= 3:
+        up(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "")
+    elif cmd == "down" and len(sys.argv) >= 3:
+        down(sys.argv[2])
+    elif cmd == "disconnect":
+        for row in profiles():
+            if row["active"]:
+                down(row["uuid"])
+    else:
+        raise SystemExit("usage: vpn list|status|up UUID [PSK]|down UUID|disconnect")
+
+
+if __name__ == "__main__":
+    main()

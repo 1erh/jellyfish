@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Step to the next/previous of the five pinned workspaces on one monitor."""
+import json
+import subprocess
+import sys
+
+output, delta = sys.argv[1], int(sys.argv[2])
+monitors = json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"]))
+def rank(name):
+    return (0 if name.startswith(("eDP-", "LVDS-", "DSI-")) else 1, name)
+
+
+names = sorted((m["name"] for m in monitors), key=rank)
+monitor = next((m for m in monitors if m["name"] == output), None)
+if monitor is None:
+    raise SystemExit(0)
+
+base = names.index(output) * 10
+current = int(monitor["activeWorkspace"]["id"]) - base
+target = base + (current - 1 + delta) % 5 + 1
+subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ workspace = "{target}" }})'],
+               stdout=subprocess.DEVNULL, check=False)

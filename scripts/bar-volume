@@ -1,0 +1,14 @@
+#!/bin/sh
+out=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null) || exit 0
+level=$(printf '%s\n' "$out" | awk '{ printf "%d", $2 * 100 + 0.5 }')
+case "$out" in
+    *MUTED*) icon="󰝟"; class="muted" ;;
+    *)
+        if [ "$level" -ge 66 ]; then icon="󰕾"
+        elif [ "$level" -ge 33 ]; then icon="󰖀"
+        else icon="󰕿"
+        fi
+        class="on"
+        ;;
+esac
+printf '{"text":"%s","class":"%s","tooltip":"音量 %s%%"}\n' "$icon" "$class" "$level"

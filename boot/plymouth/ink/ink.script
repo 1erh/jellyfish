@@ -1,0 +1,52 @@
+// Ink #0c0b0a background, three 10px squares that step left to right.
+Window.SetBackgroundTopColor(0.047, 0.043, 0.039);
+Window.SetBackgroundBottomColor(0.047, 0.043, 0.039);
+
+on = Image("on.png");
+off = Image("off.png");
+
+count = 3;
+size = 10;
+gap = 10;
+total = count * size + (count - 1) * gap;
+cx = Window.GetX() + Window.GetWidth() / 2;
+cy = Window.GetY() + Window.GetHeight() / 2;
+
+for (i = 0; i < count; i++) {
+    dots[i] = Sprite(off);
+    dots[i].SetX(Math.Int(cx - total / 2 + i * (size + gap)));
+    dots[i].SetY(Math.Int(cy - size / 2));
+}
+
+tick = 0;
+
+fun refresh() {
+    tick++;
+    lit = Math.Int(tick / 12) % count;
+    for (i = 0; i < count; i++) {
+        if (i == lit)
+            dots[i].SetImage(on);
+        else
+            dots[i].SetImage(off);
+    }
+}
+
+Plymouth.SetRefreshFunction(refresh);
+
+// Disk-unlock prompt, if one is ever needed: a hairline bar that fills with bullets.
+fun display_password(prompt, bullets) {
+    text = "";
+    for (i = 0; i < bullets; i++)
+        text += "•";
+    entry = Image.Text(prompt + "  " + text, 0.9, 0.88, 0.84);
+    password_sprite = Sprite(entry);
+    password_sprite.SetX(Math.Int(cx - entry.GetWidth() / 2));
+    password_sprite.SetY(Math.Int(cy + 40));
+}
+
+fun display_normal() {
+    password_sprite = NULL;
+}
+
+Plymouth.SetDisplayPasswordFunction(display_password);
+Plymouth.SetDisplayNormalFunction(display_normal);

@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Write one Waybar bar per connected monitor, then (re)start Waybar if that changed.
+
+Run at login and whenever a monitor is added or removed. Workspace IDs follow
+hyprland.lua: a built-in panel (eDP-, LVDS-, DSI-) takes the first slot when one
+is connected, and external outputs follow it. Slot * 10 + 1..5.
+"""
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+HOME = Path.home()
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+FEED = RUNTIME / "bar-feed"
+CONFIG = HOME / ".config/waybar/config.jsonc"
+HYPRLOCK = HOME / ".config/hypr/hyprlock.conf"
+SCRIPTS = HOME / ".config/hypr/scripts"
+QS = f"qs -p {HOME}/.config/hypr/launcher ipc call"
+PRELOAD = HOME / ".config/hypr/lib/tray-menu.so"
+WS_SPAN = 10
+WS_PINNED = 5
+APP_SLOTS = 6
+
+
+def monitor_rank(name):
+    internal = name.startswith(("eDP-", "LVDS-", "DSI-"))
+    return (0 if internal else 1, name)
+
+
+def monitors():
+    try:
+        return json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"]))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+def workspace(output, slot, index):
+    ws = str(slot * WS_SPAN + index)
+    return {
+        "exec": f"cat {FEED}/ws-{output}-{index}.json",
+        "return-type": "json",
+        "interval": "once",
+        "signal": 8,
+        "on-click": f"hyprctl dispatch 'hl.dsp.focus({{ workspace = \"{ws}\" }})'",
+        "on-scroll-up": f"{SCRIPTS}/ws-step {output} -1",
+        "on-scroll-down": f"{SCRIPTS}/ws-step {output} 1",
+    }
+
+
+def bar(output, slot):
+    panel = lambda kind: f"{QS} panel toggle {kind} {output}"
+    cfg = {
+        "output": output,
+        "layer": "top",
+        "position": "top",
+        "height": 30,
+        "spacing": 0,
+        "reload_style_on_change": True,
+        "modules-left": [f"custom/w{i}" for i in range(1, WS_PINNED + 1)]
+        + [f"image#app{i}" for i in range(1, APP_SLOTS + 1)],
+        "modules-center": ["hyprland/window"],
+        "modules-right": [
+            "tray",
+            "custom/notifications",
+            "network",
+            "custom/vpn",
+            "bluetooth",
+            "custom/music",
+            "custom/volume",
+            "custom/brightness",
+            "custom/clock",
+            "custom/power",
+        ],
+        "hyprland/window": {
+            "format": "{title}",
+            "separate-outputs": True,
+            "max-length": 56,
+            "rewrite": {
+                "(.*) — Zen Browser": "$1",
+                "(.*) - Zen Browser": "$1",
+                "(.*) - YouTube": "$1",
+                "(.*) - Cursor": "$1",
+                "(.*) - Dolphin": "$1",
+            },
+            "tooltip": False,
+        },
+        "custom/notifications": {
+            "exec": "swaync-client -swb",
+            "return-type": "json",
+            "format": "{icon}",
+            "format-icons": {
+                "notification": "󱅫",
+                "none": "󰂚",
+                "dnd-notification": "󰂛",
+                "dnd-none": "󰂛",
+                "inhibited-notification": "󱅫",
+                "inhibited-none": "󰂚",
+                "dnd-inhibited-notification": "󰂛",
+                "dnd-inhibited-none": "󰂛",
+            },
+            "on-click": "swaync-client -t -sw",
+            "on-click-right": "swaync-client -d -sw",
+            "escape": True,
+            "tooltip": True,
+            "tooltip-format": "通知 {} 件 · クリックで開く · 右クリックでおやすみモード",
+        },
+        "network": {
+            "interval": 5,
+            "format-wifi": "{icon}",
+            "format-icons": ["󰤟", "󰤢", "󰤥", "󰤨"],
+            "format-ethernet": "󰈀",
+            "format-linked": "󰤫",
+            "format-disconnected": "󰤭",
+            "format-disabled": "󰤮",
+            "tooltip-format-wifi": "{essid} · {signalStrength}% · クリックで一覧 · 右クリックで切替",
+            "tooltip-format-ethernet": "有線 · {ifname}",
+            "tooltip-format-disconnected": "未接続 · クリックで一覧",
+            "tooltip-format-disabled": "Wi-Fi オフ · 右クリックでオン",
+            "on-click": panel("wifi"),
+            "on-click-right": f"{SCRIPTS}/radio wifi",
+        },
+        "custom/vpn": {
+            "exec": f"{SCRIPTS}/vpn status",
+            "return-type": "json",
+            "interval": 5,
+            "signal": 9,
+            "on-click": panel("vpn"),
+            "on-click-right": f"{SCRIPTS}/vpn disconnect",
+            "tooltip": True,
+        },
+        "bluetooth": {
+            "format": "󰂯",
+            "format-on": "󰂯",
+            "format-off": "󰂲",
+            "format-disabled": "󰂲",
+            "format-connected": "󰂱",
+            "format-no-controller": "",
+            "tooltip-format": "Bluetooth {status} · クリックで機器 · 右クリックで切替",
+            "tooltip-format-connected": "{device_alias} に接続中 · クリックで機器 · 右クリックで切替",
+            "tooltip-format-off": "Bluetooth オフ · 右クリックでオン",
+            "on-click": panel("bluetooth"),
+            "on-click-right": f"{SCRIPTS}/radio bluetooth",
+        },
+        "tray": {"spacing": 10, "icon-size": 18, "show-passive-items": False},
+        "custom/power": {
+            "format": "󰐥",
+            "on-click": f"{QS} power toggle",
+            "tooltip": True,
+            "tooltip-format": "電源",
+        },
+        "custom/clock": {
+            "exec": "LC_TIME=ja_JP.UTF-8 date +'%-m月%-d日 (%a)  %H:%M'",
+            "interval": 10,
+            "on-click": panel("calendar"),
+            "tooltip": True,
+            "tooltip-format": "カレンダー",
+        },
+        "custom/music": {
+            "exec": f"{SCRIPTS}/bar-music",
+            "return-type": "json",
+            "interval": 1,
+            "on-click": panel("music"),
+            "tooltip": True,
+        },
+        "custom/volume": {
+            "exec": f"{SCRIPTS}/bar-volume",
+            "return-type": "json",
+            "interval": 1,
+            "on-click": panel("volume"),
+            "tooltip": True,
+        },
+        "custom/brightness": {
+            "format": "󰖨",
+            "on-click": panel("brightness"),
+            "tooltip": True,
+            "tooltip-format": "明るさ",
+        },
+    }
+    for i in range(1, WS_PINNED + 1):
+        cfg[f"custom/w{i}"] = workspace(output, slot, i)
+    for i in range(1, APP_SLOTS + 1):
+        cfg[f"image#app{i}"] = {
+            "exec": f"cat {FEED}/app-{output}-{i - 1}.txt",
+            "size": 18,
+            "interval": "once",
+            "signal": 10,
+            "on-click": f"{SCRIPTS}/bar-tasks click {output} {i - 1}",
+            "tooltip": True,
+        }
+    return cfg
+
+
+def running():
+    return subprocess.run(["pidof", "-q", "waybar"]).returncode == 0
+
+
+def restart():
+    subprocess.run(["pkill", "-x", "waybar"], check=False)
+    for _ in range(20):
+        if not running():
+            break
+        time.sleep(0.1)
+    env = dict(os.environ, LD_PRELOAD=str(PRELOAD))
+    subprocess.Popen(["waybar"], env=env, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    names = sorted((m["name"] for m in monitors() if not m.get("disabled")), key=monitor_rank)
+    if not names:
+        return
+    # Lock-screen clock sits on the main output: the built-in panel when it is connected.
+    if HYPRLOCK.exists():
+        main = names[0]
+        lock = HYPRLOCK.read_text()
+        updated = re.sub(r"(?m)^\$main = .*$", f"$main = {main}", lock, count=1)
+        if updated != lock:
+            HYPRLOCK.write_text(updated)
+    text = json.dumps([bar(n, slot) for slot, n in enumerate(names)], ensure_ascii=False, indent=4) + "\n"
+    old = CONFIG.read_text() if CONFIG.exists() else ""
+    if text != old:
+        CONFIG.write_text(text)
+        restart()
+    elif not running():
+        restart()
+
+
+if __name__ == "__main__":
+    main()

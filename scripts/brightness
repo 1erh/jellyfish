@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Read or set one monitor's brightness as a percent.
+
+Built-in panels (eDP-, LVDS-, DSI-) use their backlight. External monitors use
+ddcutil, matched by the DRM connector name: the digits in "eDP-1" are not a
+display number, so the laptop panel never drives the external monitor.
+"""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BACKLIGHT = Path("/sys/class/backlight")
+INTERNAL = ("eDP-", "LVDS-", "DSI-")
+
+
+def internal(output):
+    return output.startswith(INTERNAL)
+
+
+def backlight_for(output):
+    found = []
+    if not BACKLIGHT.is_dir():
+        return None
+    for entry in BACKLIGHT.iterdir():
+        device = entry / "device"
+        link = os.path.realpath(device) if device.exists() else ""
+        found.append((output in link, entry))
+    found.sort(key=lambda item: not item[0])
+    return found[0][1] if found else None
+
+
+def percent(current, maximum):
+    if maximum <= 0:
+        raise SystemExit("brightness range is empty")
+    return str(max(0, min(100, round(current * 100 / maximum))))
+
+
+def read_backlight(output):
+    path = backlight_for(output)
+    if path is None:
+        raise SystemExit(f"no backlight for {output}")
+    current = int((path / "brightness").read_text())
+    maximum = int((path / "max_brightness").read_text())
+    print(percent(current, maximum))
+
+
+def write_backlight(output, value):
+    path = backlight_for(output)
+    if path is None:
+        raise SystemExit(f"no backlight for {output}")
+    maximum = int((path / "max_brightness").read_text())
+    target = max(0, min(maximum, round(value / 100 * maximum)))
+    subprocess.run(
+        ["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1/session/auto",
+         "org.freedesktop.login1.Session", "SetBrightness", "ssu",
+         "backlight", path.name, str(target)],
+        check=True,
+    )
+
+
+def ddc_display(output):
+    # "Display 1" applies until the next display. Match the connector, e.g. card1-DP-1.
+    text = subprocess.check_output(["ddcutil", "detect", "--brief"], text=True, stderr=subprocess.DEVNULL)
+    number = None
+    for line in text.splitlines():
+        display = re.search(r"Display\s+(\d+)", line)
+        if display:
+            number = display.group(1)
+        if re.search(rf"connector:\s+\S*-{re.escape(output)}\s*$", line) and number:
+            return number
+    raise SystemExit(f"no ddc display for {output}")
+
+
+def read_ddc(output):
+    number = ddc_display(output)
+    text = subprocess.check_output(["ddcutil", "--brief", "--display", number, "getvcp", "10"], text=True)
+    parts = text.split()
+    current, maximum = int(parts[3]), int(parts[4])
+    print(percent(current, maximum))
+
+
+def write_ddc(output, value):
+    number = ddc_display(output)
+    subprocess.run(
+        ["ddcutil", "--noverify", "--display", number, "setvcp", "10", str(int(value))],
+        check=True,
+    )
+
+
+def main():
+    if len(sys.argv) not in (3, 4) or sys.argv[1] not in ("get", "set"):
+        raise SystemExit("usage: brightness get OUTPUT | brightness set OUTPUT PERCENT")
+    action, output = sys.argv[1], sys.argv[2]
+    if action == "get":
+        (read_backlight if internal(output) else read_ddc)(output)
+        return
+    value = max(0, min(100, int(sys.argv[3])))
+    (write_backlight if internal(output) else write_ddc)(output, value)
+
+
+if __name__ == "__main__":
+    main()

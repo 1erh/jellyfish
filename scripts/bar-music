@@ -1,0 +1,7 @@
+#!/bin/sh
+# Playing and idle use different glyphs, both about as wide as a tray icon.
+if playerctl -a status 2>/dev/null | grep -qx Playing; then
+    printf '%s\n' '{"text":"","class":"playing","tooltip":"再生中"}'
+else
+    printf '%s\n' '{"text":"󰎊","class":"idle","tooltip":"再生していません"}'
+fi

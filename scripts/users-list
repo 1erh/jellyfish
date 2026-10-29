@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Print login users and their seat0 sessions as JSON for the user switcher."""
+
+import json
+import os
+import pwd
+import subprocess
+
+
+def sessions():
+    out = subprocess.run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True).stdout
+    found = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        sid = parts[0]
+        props = subprocess.run(
+            ["loginctl", "show-session", sid, "-p", "Name", "-p", "Seat", "-p", "Class", "-p", "State"],
+            capture_output=True, text=True,
+        ).stdout
+        info = dict(p.split("=", 1) for p in props.splitlines() if "=" in p)
+        if info.get("Class") != "user" or info.get("Seat") != "seat0" or info.get("State") == "closing":
+            continue
+        found.setdefault(info.get("Name"), sid)
+    return found
+
+
+def avatar(user):
+    for path in (f"/var/lib/AccountsService/icons/{user.pw_name}", os.path.join(user.pw_dir, ".face")):
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            return path
+    return ""
+
+
+def main():
+    current = os.environ.get("XDG_SESSION_ID", "")
+    me = pwd.getpwuid(os.getuid()).pw_name
+    live = sessions()
+    users = []
+    for user in sorted(pwd.getpwall(), key=lambda u: u.pw_uid):
+        if not 1000 <= user.pw_uid < 60000 or user.pw_shell.endswith(("nologin", "false")):
+            continue
+        display = user.pw_gecos.split(",")[0] or user.pw_name
+        session = live.get(user.pw_name, "")
+        users.append({
+            "name": user.pw_name,
+            "display": display,
+            "avatar": avatar(user),
+            "session": session,
+            "current": user.pw_name == me,
+            "currentSession": current,
+        })
+    greeter = subprocess.run(
+        ["busctl", "--system", "status", "org.freedesktop.DisplayManager"],
+        capture_output=True,
+    ).returncode == 0
+    print(json.dumps({"users": users, "greeter": greeter}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

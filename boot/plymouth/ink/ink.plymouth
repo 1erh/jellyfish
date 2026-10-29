@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Ink
+Description=Ink background with three square steps, matching the Hyprland shell.
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/ink
+ScriptFile=/usr/share/plymouth/themes/ink/ink.script

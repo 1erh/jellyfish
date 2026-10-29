@@ -1,0 +1,16 @@
+#!/bin/sh
+# Toggle a radio from the bar: radio wifi | radio bluetooth
+case "$1" in
+wifi)
+    if [ "$(nmcli radio wifi)" = enabled ]; then nmcli radio wifi off; else nmcli radio wifi on; fi
+    ;;
+bluetooth)
+    # bluetoothctl waits forever when bluetoothd is not running.
+    if timeout 3 bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
+        timeout 3 bluetoothctl power off >/dev/null
+    else
+        rfkill unblock bluetooth
+        timeout 3 bluetoothctl power on >/dev/null
+    fi
+    ;;
+esac

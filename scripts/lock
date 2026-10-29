@@ -1,0 +1,14 @@
+#!/bin/sh
+# Lock from the power menu or Super+L. These can only be used while the screen is
+# unlocked, so any hyprlock still running at that point holds no lock and would
+# otherwise make "pidof hyprlock || hyprlock" do nothing.
+if pidof -q hyprlock; then
+    pkill -x hyprlock
+    i=0
+    while pidof -q hyprlock && [ "$i" -lt 20 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    pkill -9 -x hyprlock 2>/dev/null
+fi
+exec hyprlock
